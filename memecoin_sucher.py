@@ -205,21 +205,74 @@ def punkte(k: dict, quellen: set, links: int, max_alter: float) -> float:
 # --------------------------------------------------------------------------
 # 4) RugCheck
 # --------------------------------------------------------------------------
-def rugcheck(adresse: str) -> dict:
-    """Gibt {risiko 0-100, gefahren [...], lp_lock %} zurück (oder leere Werte)."""
-    d = hole_json(f"{RUG}/tokens/{adresse}/report/summary")
-    if not isinstance(d, dict):
-        return {"risiko": None, "gefahren": [], "lp_lock": None}
-    gefahren = [
-        r.get("name", "?")
-        for r in d.get("risks") or []
-        if str(r.get("level", "")).lower() == "danger"
-    ]
-    return {
-        "risiko": d.get("score_normalised"),
-        "gefahren": gefahren,
-        "lp_lock": d.get("lpLockedPct"),
-    }
+# Sicherheits-Grenzen (strenger als RugCheck allein)
+SICHERHEIT = {
+    "min_holder": 300,          # weniger Holder = zu leicht zu manipulieren
+    "min_holder_kaufrausch": 400,
+    "max_top10_pct": 35,        # Top-10-Wallets (ohne Börsen-Pools) besitzen max. 35 %
+    "max_einzel_pct": 12,       # keine einzelne Wallet über 12 %
+    "max_insider_pct": 10,      # verbundene Insider-Wallets max. 10 %
+    "min_lp_lock_pct": 90,      # Liquidität muss zu mind. 90 % gesperrt/verbrannt sein
+    "max_kaeufe_pro_holder": 8, # mehr Käufe/Stunde pro Holder = Bots treiben den Kurs
+    "min_alter_h_kaufrausch": 0.5,
+}
+# RugCheck-Warnungen, die wir wie eine Gefahr behandeln
+BLOCK_WARNUNGEN = {
+    "top 10 holders high ownership", "single holder ownership", "high ownership",
+    "large amount of lp unlocked", "low amount of lp providers", "copycat token",
+    "creator history of rugged tokens", "mutable metadata", "freeze authority still enabled",
+    "mint authority still enabled", "high insider ownership",
+}
+
+
+def rugcheck(adresse: str, k: dict | None = None, kaufrausch: bool = False) -> dict:
+    """Sicherheits-Check über den vollen RugCheck-Bericht.
+    Gibt {risiko, gefahren [Gründe gegen eine Meldung], lp_lock, holder, top10} zurück.
+    Jeder Eintrag in 'gefahren' verhindert einen Push."""
+    leer = {"risiko": None, "gefahren": ["RugCheck kennt den Coin noch nicht"],
+            "lp_lock": None, "holder": None, "top10": None}
+    d = hole_json(f"{RUG}/tokens/{adresse}/report")
+    if not isinstance(d, dict) or not d.get("mint"):
+        return leer
+    c = SICHERHEIT
+    gruende = []
+    if d.get("rugged"):
+        gruende.append("bereits gerugged")
+    for r in d.get("risks") or []:
+        name = str(r.get("name", "?"))
+        if str(r.get("level", "")).lower() == "danger" or name.lower() in BLOCK_WARNUNGEN:
+            gruende.append(name)
+
+    bekannte = d.get("knownAccounts") or {}
+    pools = {a for a, info in bekannte.items()
+             if str((info or {}).get("type", "")).upper() in ("AMM", "LOCKER")}
+    echte = [h for h in (d.get("topHolders") or [])
+             if h.get("owner") not in pools and h.get("address") not in pools]
+    top10 = sum(float(h.get("pct") or 0) for h in echte[:10])
+    einzel = max([float(h.get("pct") or 0) for h in echte] or [0])
+    insider = sum(float(h.get("pct") or 0) for h in echte if h.get("insider"))
+    holder = int(d.get("totalHolders") or 0)
+    locks = [float(((m.get("lp") or {}).get("lpLockedPct")) or 0) for m in d.get("markets") or []]
+    lp_lock = max(locks) if locks else None
+
+    min_h = c["min_holder_kaufrausch"] if kaufrausch else c["min_holder"]
+    if holder < min_h:
+        gruende.append(f"nur {holder} Holder")
+    if top10 > c["max_top10_pct"]:
+        gruende.append(f"Top-10 besitzen {top10:.0f}%")
+    if einzel > c["max_einzel_pct"]:
+        gruende.append(f"eine Wallet hat {einzel:.0f}%")
+    if insider > c["max_insider_pct"] or (d.get("graphInsidersDetected") or 0) > 0:
+        gruende.append("Insider-Netzwerk")
+    if lp_lock is not None and lp_lock < c["min_lp_lock_pct"]:
+        gruende.append(f"LP nur {lp_lock:.0f}% gesperrt")
+    if k is not None and holder:
+        if k["kaeufe"] / holder > c["max_kaeufe_pro_holder"]:
+            gruende.append(f"Bot-Handel ({k['kaeufe']} Käufe bei {holder} Holdern)")
+        if kaufrausch and k["alter_h"] < c["min_alter_h_kaufrausch"]:
+            gruende.append("jünger als 30 Min")
+    return {"risiko": d.get("score_normalised"), "gefahren": gruende,
+            "lp_lock": lp_lock, "holder": holder, "top10": round(top10, 1)}
 
 
 def rug_abzug(r: dict) -> float:
@@ -346,11 +399,12 @@ def melde_treffer(ergebnisse: list[dict], a: argparse.Namespace) -> None:
                 or e["score"] < a.alarm_ab or e["rug"]["gefahren"]):
             continue
         k, r = e["k"], e["rug"]
-        rug = "nicht geprüft" if r["risiko"] is None else f"{int(r['risiko'])}/100"
+        rug = (f"{int(r['risiko'] or 0)}/100 | {r['holder']} Holder | Top-10 {r['top10']}% | "
+               f"LP {r['lp_lock'] or 0:.0f}% gesperrt")
         text = (f"{k['name']} - {e['score']:.0f} Punkte\n"
                 f"Alter {k['alter_h']:.0f}h | Liq {geld(k['liq'])} | MCap {geld(k['mcap'])}\n"
                 f"1h {k['chg1']:+.0f}% | Käufe/Verkäufe {k['kaeufe']}/{k['verkaeufe']}\n"
-                f"Rug-Risiko {rug}\n"
+                f"Sicherheit: {rug}\n"
                 f"Symbol: {str(k['symbol']).strip().upper()}\n"
                 f"Adresse: {e['adresse']}")
         fomo = FOMO + e["adresse"]
@@ -411,19 +465,20 @@ def melde_kaufrausch(markt: dict, jetzt_ms: int, a: argparse.Namespace) -> None:
         sym = str(k["symbol"]).strip().upper()
         if adr in schon or "sym:" + sym in schon:
             continue
-        r = rugcheck(adr)
+        r = rugcheck(adr, k, kaufrausch=True)
         print(f"  KAUFRAUSCH: {k['symbol']} 1h {k['chg1']:+.0f}% | "
               f"Käufe/Verkäufe {k['kaeufe']}/{k['verkaeufe']} | Rug {r['risiko']}")
         if r["gefahren"]:
-            print(f"    (kein Alarm - RugCheck-Gefahr: {', '.join(r['gefahren'])[:60]})")
+            print(f"    (kein Alarm - Sicherheits-Check: {', '.join(r['gefahren'])[:90]})")
             schon.update({adr, "sym:" + sym})
             continue
-        rug = "nicht geprüft" if r["risiko"] is None else f"{int(r['risiko'])}/100"
+        rug = (f"{int(r['risiko'])}/100 | {r['holder']} Holder | Top-10 {r['top10']}% | "
+               f"LP {r['lp_lock'] or 0:.0f}% gesperrt")
         text = (f"{k['name']} wird gerade massiv gekauft!\n"
                 f"1h {k['chg1']:+.0f}% | 5min {k['chg5']:+.0f}% | Alter {k['alter_h']:.0f}h\n"
                 f"MCap {geld(k['mcap'])} | Liq {geld(k['liq'])} | Umsatz 1h {geld(k['vol1'])}\n"
                 f"Käufe/Verkäufe 1h {k['kaeufe']}/{k['verkaeufe']}\n"
-                f"Rug-Risiko {rug}\n"
+                f"Sicherheit: {rug}\n"
                 f"Kaufrausch-ID: {adr}")
         fomo = FOMO + adr
         if a.ntfy and sende_push(a.ntfy, f"🔥🚨 KAUFRAUSCH: {k['symbol']} "
@@ -669,7 +724,7 @@ def zeige(ergebnisse: list[dict]) -> None:
     for i, e in enumerate(ergebnisse, 1):
         k, r = e["k"], e["rug"]
         rug = "-" if r["risiko"] is None else str(int(r["risiko"]))
-        warn = ", ".join(r["gefahren"])[:40] or ("ok" if r["risiko"] is not None else "nicht geprüft")
+        warn = ", ".join(r["gefahren"])[:60] or "ok"
         print(f"{i:>2}  {k['symbol'][:11]:<12}{e['score']:>7.0f}{k['alter_h']:>6.0f}h"
               f"{geld(k['liq']):>8}{geld(k['mcap']):>8}{geld(k['vol24']):>8}"
               f"{k['chg1']:>+7.0f}{str(k['kaeufe'])+'/'+str(k['verkaeufe']):>10}{rug:>5}  {warn}")
@@ -733,7 +788,7 @@ def ein_durchlauf(a: argparse.Namespace) -> list[dict]:
     for e in top:
         e["rug"] = {"risiko": None, "gefahren": [], "lp_lock": None}
         if not a.ohne_rugcheck:
-            e["rug"] = rugcheck(e["adresse"])
+            e["rug"] = rugcheck(e["adresse"], e["k"])
             e["score"] = max(0.0, e["score"] - rug_abzug(e["rug"]))
             time.sleep(0.3)
 
