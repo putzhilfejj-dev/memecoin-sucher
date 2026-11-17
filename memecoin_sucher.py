@@ -69,6 +69,13 @@ def hole_json(url: str, versuche: int = 3):
     return None
 
 
+GECKO = "https://api.geckoterminal.com/api/v2/networks/solana"
+GECKO_FEEDS = {
+    "gecko-trend": ["/trending_pools?page=1", "/trending_pools?page=2"],
+    "gecko-neu": ["/new_pools?page=1", "/new_pools?page=2"],
+}
+
+
 # --------------------------------------------------------------------------
 # 1) Kandidaten sammeln
 # --------------------------------------------------------------------------
@@ -88,7 +95,29 @@ def sammle_kandidaten() -> dict[str, dict]:
             k = kandidaten.setdefault(adr, {"quellen": set(), "links": 0})
             k["quellen"].add(name)
             k["links"] = max(k["links"], len(eintrag.get("links") or []))
+    # GeckoTerminal: Trend- und Neu-Listen (findet auch Coins ohne DexScreener-Profil)
+    for name, pfade in GECKO_FEEDS.items():
+        for pfad in pfade:
+            d = hole_json(GECKO + pfad)
+            for pool in (d or {}).get("data", []) if isinstance(d, dict) else []:
+                tid = (((pool.get("relationships") or {}).get("base_token") or {})
+                       .get("data") or {}).get("id", "")
+                if not tid.startswith("solana_"):
+                    continue
+                adr = tid[7:]
+                if adr in STABIL:
+                    continue
+                k = kandidaten.setdefault(adr, {"quellen": set(), "links": 0})
+                k["quellen"].add(name)
     return kandidaten
+
+
+# Keine Memecoins - nie melden
+STABIL = {
+    "So11111111111111111111111111111111111111112",   # SOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+}
 
 
 # --------------------------------------------------------------------------
@@ -118,6 +147,7 @@ def hole_marktdaten(adressen: list[str]) -> dict[str, dict]:
 # --------------------------------------------------------------------------
 def kennzahlen(p: dict, jetzt_ms: int) -> dict:
     tx_h1 = (p.get("txns") or {}).get("h1") or {}
+    tx_m5 = (p.get("txns") or {}).get("m5") or {}
     kaeufe, verkaeufe = tx_h1.get("buys", 0) or 0, tx_h1.get("sells", 0) or 0
     erstellt = p.get("pairCreatedAt") or jetzt_ms
     return {
@@ -130,6 +160,10 @@ def kennzahlen(p: dict, jetzt_ms: int) -> dict:
         "vol1": (p.get("volume") or {}).get("h1") or 0,
         "chg1": (p.get("priceChange") or {}).get("h1") or 0,
         "chg24": (p.get("priceChange") or {}).get("h24") or 0,
+        "chg5": (p.get("priceChange") or {}).get("m5") or 0,
+        "vol5": (p.get("volume") or {}).get("m5") or 0,
+        "kaeufe5": tx_m5.get("buys", 0) or 0,
+        "verkaeufe5": tx_m5.get("sells", 0) or 0,
         "kaeufe": kaeufe,
         "verkaeufe": verkaeufe,
         "alter_h": max(0.0, (jetzt_ms - erstellt) / 3_600_000),
@@ -287,6 +321,10 @@ def lade_gemeldet(thema: str = "") -> set:
             for zeile in str(m.get("message", "")).splitlines():
                 if zeile.startswith("Adresse: "):
                     gemeldet.add(zeile[9:].strip())
+                elif zeile.startswith("Kaufrausch-ID: "):
+                    gemeldet.add(zeile[15:].strip())
+                elif zeile.startswith("Symbol: "):
+                    gemeldet.add("sym:" + zeile[8:].strip().upper())
     return gemeldet
 
 
@@ -303,7 +341,9 @@ def melde_treffer(ergebnisse: list[dict], a: argparse.Namespace) -> None:
     gemeldet = lade_gemeldet(a.ntfy)
     neu = 0
     for e in ergebnisse:
-        if e["adresse"] in gemeldet or e["score"] < a.alarm_ab or e["rug"]["gefahren"]:
+        sym_key = "sym:" + str(e["k"]["symbol"]).strip().upper()
+        if (e["adresse"] in gemeldet or sym_key in gemeldet
+                or e["score"] < a.alarm_ab or e["rug"]["gefahren"]):
             continue
         k, r = e["k"], e["rug"]
         rug = "nicht geprüft" if r["risiko"] is None else f"{int(r['risiko'])}/100"
@@ -311,15 +351,92 @@ def melde_treffer(ergebnisse: list[dict], a: argparse.Namespace) -> None:
                 f"Alter {k['alter_h']:.0f}h | Liq {geld(k['liq'])} | MCap {geld(k['mcap'])}\n"
                 f"1h {k['chg1']:+.0f}% | Käufe/Verkäufe {k['kaeufe']}/{k['verkaeufe']}\n"
                 f"Rug-Risiko {rug}\n"
+                f"Symbol: {str(k['symbol']).strip().upper()}\n"
                 f"Adresse: {e['adresse']}")
         fomo = FOMO + e["adresse"]
         if sende_push(a.ntfy, f"🚨 Neuer Memecoin: {k['symbol']}", text, fomo,
                       knoepfe=[("FOMO", fomo), ("DexScreener", k["url"])]):
             gemeldet.add(e["adresse"])
+            gemeldet.add(sym_key)
             neu += 1
     speichere_gemeldet(gemeldet)
     if neu:
         print(f"  {neu} Push-Nachricht(en) ans Handy geschickt")
+
+
+# --------------------------------------------------------------------------
+# KAUFRAUSCH: junger Coin wird gerade massiv gekauft
+# --------------------------------------------------------------------------
+KAUFRAUSCH = {
+    "max_alter_h": 24,      # nur Coins jünger als 24 Stunden
+    "min_liq": 8_000,       # mindestens 8.000 $ Liquidität
+    "min_kaeufe_1h": 200,   # mindestens 200 Käufe in der letzten Stunde
+    "kauf_verhaeltnis": 1.5,  # mindestens 1,5x so viele Käufe wie Verkäufe
+    "min_vol_1h": 20_000,   # mindestens 20.000 $ Umsatz in der letzten Stunde
+    "min_anstieg_1h": 50,   # Kurs +50 % in 1 Stunde ...
+    "min_anstieg_5m": 15,   # ... ODER +15 % in 5 Minuten
+}
+
+
+def ist_kaufrausch(k: dict) -> bool:
+    c = KAUFRAUSCH
+    return (k["alter_h"] <= c["max_alter_h"]
+            and k["liq"] >= c["min_liq"]
+            and k["kaeufe"] >= c["min_kaeufe_1h"]
+            and k["kaeufe"] >= c["kauf_verhaeltnis"] * max(k["verkaeufe"], 1)
+            and k["vol1"] >= c["min_vol_1h"]
+            and (k["chg1"] >= c["min_anstieg_1h"] or k["chg5"] >= c["min_anstieg_5m"]))
+
+
+def melde_kaufrausch(markt: dict, jetzt_ms: int, a: argparse.Namespace) -> None:
+    """Lauter Alarm, wenn ein junger Coin gerade massiv gekauft wird (pro Coin nur einmal)."""
+    treffer = []
+    for adr, p in markt.items():
+        if adr in STABIL:
+            continue
+        k = kennzahlen(p, jetzt_ms)
+        if ist_kaufrausch(k):
+            treffer.append((adr, k))
+    if not treffer:
+        return
+    zustand = lade_zustand()
+    schon = set(zustand.setdefault("kaufrausch", []))
+    if a.ntfy:
+        for m in ntfy_verlauf(a.ntfy, "12h"):
+            for z in str(m.get("message", "")).splitlines():
+                if z.startswith("Kaufrausch-ID: "):
+                    schon.add(z[15:].strip())
+    treffer.sort(key=lambda t: t[1]["chg1"], reverse=True)
+    for adr, k in treffer[:5]:
+        sym = str(k["symbol"]).strip().upper()
+        if adr in schon or "sym:" + sym in schon:
+            continue
+        r = rugcheck(adr)
+        print(f"  KAUFRAUSCH: {k['symbol']} 1h {k['chg1']:+.0f}% | "
+              f"Käufe/Verkäufe {k['kaeufe']}/{k['verkaeufe']} | Rug {r['risiko']}")
+        if r["gefahren"]:
+            print(f"    (kein Alarm - RugCheck-Gefahr: {', '.join(r['gefahren'])[:60]})")
+            schon.update({adr, "sym:" + sym})
+            continue
+        rug = "nicht geprüft" if r["risiko"] is None else f"{int(r['risiko'])}/100"
+        text = (f"{k['name']} wird gerade massiv gekauft!\n"
+                f"1h {k['chg1']:+.0f}% | 5min {k['chg5']:+.0f}% | Alter {k['alter_h']:.0f}h\n"
+                f"MCap {geld(k['mcap'])} | Liq {geld(k['liq'])} | Umsatz 1h {geld(k['vol1'])}\n"
+                f"Käufe/Verkäufe 1h {k['kaeufe']}/{k['verkaeufe']}\n"
+                f"Rug-Risiko {rug}\n"
+                f"Kaufrausch-ID: {adr}")
+        fomo = FOMO + adr
+        if a.ntfy and sende_push(a.ntfy, f"🔥🚨 KAUFRAUSCH: {k['symbol']} "
+                                 f"{k['chg1']:+.0f}% in 1h", text, fomo, prio=5,
+                                 knoepfe=[("FOMO", fomo), ("DexScreener", k["url"])],
+                                 tags=["fire"]):
+            print("    -> Kaufrausch-Alarm geschickt")
+        schon.update({adr, "sym:" + sym})
+    zustand = lade_zustand()
+    zustand["kaufrausch"] = sorted(schon)
+    # Wer als Kaufrausch gemeldet wurde, kommt nicht nochmal als "Neuer Memecoin"
+    zustand["gemeldet"] = sorted(set(zustand["gemeldet"]) | schon)
+    speichere_zustand(zustand)
 
 
 # --------------------------------------------------------------------------
@@ -587,13 +704,14 @@ def ein_durchlauf(a: argparse.Namespace) -> list[dict]:
     print(f"\n[{datetime.now():%H:%M:%S}] Suche neue {CHAIN.capitalize()}-Memecoins ...")
     pruefe_beobachtung(a)
     kandidaten = sammle_kandidaten()
-    print(f"  {len(kandidaten)} Tokens in den DexScreener-Feeds gefunden")
+    print(f"  {len(kandidaten)} Tokens in den Feeds gefunden (DexScreener + GeckoTerminal)")
     if not kandidaten:
         print("  (Keine Daten - Internetverbindung prüfen.)")
         return []
 
     markt = hole_marktdaten(list(kandidaten))
     jetzt = int(time.time() * 1000)
+    melde_kaufrausch(markt, jetzt, a)
 
     vorauswahl = []
     for adr, p in markt.items():
@@ -645,6 +763,8 @@ def main(argv=None) -> None:
     ap.add_argument("--test-push", action="store_true", help="Nur eine Test-Nachricht ans Handy schicken")
     ap.add_argument("--cloud", action="store_true",
                     help="Cloud-Modus (GitHub): nur suchen, wenn der Laptop gerade NICHT läuft")
+    ap.add_argument("--laufzeit", type=float, default=0,
+                    help="Cloud: so viele Minuten lang wiederholt suchen (mit --watch)")
     a = ap.parse_args(argv)
     a.ntfy = a.ntfy or os.environ.get("NTFY_THEMA", "")
 
@@ -652,12 +772,12 @@ def main(argv=None) -> None:
         if not a.ntfy:
             print("Cloud-Modus braucht ein ntfy-Thema (--ntfy oder NTFY_THEMA).")
             return
-        if laptop_aktiv(a.ntfy):
-            print(f"Laptop war in den letzten {PULS_MINUTEN} Minuten aktiv - "
-                  "er übernimmt die Suche, die Cloud pausiert.")
-            return
-        print("Laptop ist aus - die Cloud sucht.")
-        a.watch = 0
+        if a.laufzeit <= 0:
+            a.watch = 0
+            if laptop_aktiv(a.ntfy):
+                print(f"Laptop war in den letzten {PULS_MINUTEN} Minuten aktiv - "
+                      "er übernimmt die Suche, die Cloud pausiert.")
+                return
 
     if a.test_push:
         if not a.ntfy:
@@ -674,13 +794,28 @@ def main(argv=None) -> None:
         print(f"Handy-Pushs aktiv (Thema '{a.ntfy}', ab {a.alarm_ab:g} Punkten)")
     try:
         letzter_puls = 0.0
+        ende = time.time() + a.laufzeit * 60 if a.laufzeit > 0 else None
         while True:
+            if a.cloud and a.laufzeit > 0 and laptop_aktiv(a.ntfy):
+                # Laptop läuft: Cloud wartet im Hintergrund und übernimmt sofort,
+                # sobald das Lebenszeichen ausbleibt
+                print(f"[{datetime.now():%H:%M}] Laptop ist an - Cloud wartet.")
+                if ende and time.time() + a.watch * 60 > ende:
+                    print("Laufzeit vorbei - der nächste GitHub-Lauf übernimmt.")
+                    break
+                time.sleep(a.watch * 60)
+                continue
+            if a.cloud:
+                print("Laptop ist aus - die Cloud sucht.")
             if (a.ntfy and not a.cloud and a.watch > 0
                     and time.time() - letzter_puls >= PULS_ALLE_MINUTEN * 60 - 30):
                 sende_puls(a.ntfy)  # sagt der Cloud: "Laptop läuft, du kannst pausieren"
                 letzter_puls = time.time()
             ein_durchlauf(a)
             if a.watch <= 0:
+                break
+            if ende and time.time() + a.watch * 60 > ende:
+                print("\nLaufzeit vorbei - der nächste GitHub-Lauf übernimmt.")
                 break
             print(f"\nNächste Suche in {a.watch:g} Minuten (Strg+C zum Beenden) ...")
             time.sleep(a.watch * 60)
