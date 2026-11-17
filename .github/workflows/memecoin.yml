@@ -1,0 +1,36 @@
+name: Memecoin-Sucher
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # alle 5 Minuten (GitHub kann sich etwas verspäten)
+  workflow_dispatch:         # erlaubt manuellen Start über "Run workflow"
+
+concurrency:
+  group: memecoin-sucher
+  cancel-in-progress: false
+
+jobs:
+  suche:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bereits gemeldete Coins laden
+        uses: actions/cache/restore@v4
+        with:
+          path: bereits_gemeldet.json
+          key: gemeldet-${{ github.run_id }}
+          restore-keys: gemeldet-
+
+      - name: Suchen (nur wenn der Laptop aus ist)
+        env:
+          NTFY_THEMA: ${{ secrets.NTFY_THEMA }}
+        run: python3 memecoin_sucher.py --cloud --csv treffer.csv
+
+      - name: Gemeldete Coins merken
+        if: always() && hashFiles('bereits_gemeldet.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: bereits_gemeldet.json
+          key: gemeldet-${{ github.run_id }}
