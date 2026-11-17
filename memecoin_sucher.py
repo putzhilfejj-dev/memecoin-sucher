@@ -226,7 +226,9 @@ def sende_push(thema: str, titel: str, text: str, link: str = "", prio: int = 4,
         return False
 
 
-PULS_MINUTEN = 12  # so lange gilt der Laptop nach dem letzten Lebenszeichen als aktiv
+PULS_MINUTEN = 25        # so lange gilt der Laptop nach dem letzten Lebenszeichen als aktiv
+PULS_ALLE_MINUTEN = 15   # Laptop sendet höchstens alle 15 Min ein Lebenszeichen
+                         # (ntfy erlaubt kostenlos ca. 250 Nachrichten pro Tag)
 
 
 def ntfy_verlauf(thema: str, seit: str) -> list[dict]:
@@ -257,15 +259,29 @@ def laptop_aktiv(thema: str) -> bool:
     return bool(ntfy_verlauf(thema + "-puls", f"{PULS_MINUTEN}m"))
 
 
+def lade_zustand() -> dict:
+    """Gespeicherter Zustand: gemeldete Coins + Alarm-Zustände der Beobachtungsliste."""
+    try:
+        with open(GEMELDET_DATEI, encoding="utf-8") as f:
+            z = json.load(f)
+    except (OSError, ValueError):
+        z = {}
+    if isinstance(z, list):  # altes Format
+        z = {"gemeldet": z}
+    z.setdefault("gemeldet", [])
+    z.setdefault("alarme", {})
+    return z
+
+
+def speichere_zustand(z: dict) -> None:
+    with open(GEMELDET_DATEI, "w", encoding="utf-8") as f:
+        json.dump(z, f, indent=1)
+
+
 def lade_gemeldet(thema: str = "") -> set:
     """Bereits gemeldete Coins: lokale Datei + alles, was in den letzten 12 h gepusht wurde
     (so meldet GitHub nichts doppelt, was der Laptop schon geschickt hat - und umgekehrt)."""
-    gemeldet: set = set()
-    try:
-        with open(GEMELDET_DATEI, encoding="utf-8") as f:
-            gemeldet = set(json.load(f))
-    except (OSError, ValueError):
-        pass
+    gemeldet = set(lade_zustand()["gemeldet"])
     if thema:
         for m in ntfy_verlauf(thema, "12h"):
             for zeile in str(m.get("message", "")).splitlines():
@@ -275,8 +291,9 @@ def lade_gemeldet(thema: str = "") -> set:
 
 
 def speichere_gemeldet(adressen: set) -> None:
-    with open(GEMELDET_DATEI, "w", encoding="utf-8") as f:
-        json.dump(sorted(adressen), f)
+    z = lade_zustand()
+    z["gemeldet"] = sorted(adressen)
+    speichere_zustand(z)
 
 
 def melde_treffer(ergebnisse: list[dict], a: argparse.Namespace) -> None:
@@ -296,12 +313,8 @@ def melde_treffer(ergebnisse: list[dict], a: argparse.Namespace) -> None:
                 f"Rug-Risiko {rug}\n"
                 f"Adresse: {e['adresse']}")
         fomo = FOMO + e["adresse"]
-        bester = e is ergebnisse[0]  # höchste Punktzahl in diesem Durchlauf
-        titel = (f"⭐ BESTER COIN: {k['symbol']}" if bester
-                 else f"Neuer Memecoin: {k['symbol']}")
-        if sende_push(a.ntfy, titel, text, fomo, prio=5 if bester else 4,
-                      knoepfe=[("FOMO", fomo), ("DexScreener", k["url"])],
-                      tags=["star", "rocket"] if bester else ["rocket"]):
+        if sende_push(a.ntfy, f"🚨 Neuer Memecoin: {k['symbol']}", text, fomo,
+                      knoepfe=[("FOMO", fomo), ("DexScreener", k["url"])]):
             gemeldet.add(e["adresse"])
             neu += 1
     speichere_gemeldet(gemeldet)
@@ -309,41 +322,209 @@ def melde_treffer(ergebnisse: list[dict], a: argparse.Namespace) -> None:
         print(f"  {neu} Push-Nachricht(en) ans Handy geschickt")
 
 
-TOP10_MINUTEN = 30  # gleiche Nr. 1 -> Rangliste höchstens alle 30 Minuten neu schicken
+# --------------------------------------------------------------------------
+# Beobachtungsliste: Alarm bei bestimmter Market Cap
+# --------------------------------------------------------------------------
+# Die Liste liegt im GitHub-Projekt. Der Laptop liest sie von dort, damit
+# Laptop und Cloud immer dieselbe Liste benutzen. Fallback: lokale Datei.
+BEOBACHTUNG_DATEI = "beobachtung.json"
+BEOBACHTUNG_URL = ("https://raw.githubusercontent.com/putzhilfejj-dev/"
+                   "memecoin-sucher/main/beobachtung.json")
 
 
-def sende_top10(ergebnisse: list[dict], a: argparse.Namespace) -> None:
-    """Rangliste 1-10 in ein eigenes ntfy-Thema (= eigene Liste in der App).
-    Coins mit RugCheck-Gefahren kommen nicht auf die Liste."""
-    if not a.ntfy:
+def lade_beobachtung(cloud: bool) -> list[dict]:
+    if not cloud:
+        liste = hole_json(BEOBACHTUNG_URL, versuche=2)
+        if isinstance(liste, list):
+            return liste
+    try:
+        with open(BEOBACHTUNG_DATEI, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def aktuelle_mcap(chain: str, adressen: list[str]) -> dict[str, dict]:
+    """Adresse -> liquidestes Handelspaar (mit marketCap, priceChange, url)."""
+    beste: dict[str, dict] = {}
+    for i in range(0, len(adressen), 30):
+        paare = hole_json(f"{DEX}/tokens/v1/{chain}/{','.join(adressen[i:i + 30])}") or []
+        for p in paare if isinstance(paare, list) else []:
+            adr = (p.get("baseToken") or {}).get("address")
+            liq = (p.get("liquidity") or {}).get("usd") or 0
+            if adr and liq >= ((beste.get(adr, {}).get("liquidity") or {}).get("usd") or 0):
+                beste[adr] = p
+    return beste
+
+
+RUECKSETZ_ABSTAND = 0.03   # Grenze wird wieder "scharf", wenn MCap 3 % zurück auf der anderen Seite ist
+SPRUNG_PAUSE_MIN = 60      # Abverkauf-/Anstieg-Alarm höchstens einmal pro Stunde je Richtung
+TAGESBERICHT_STUNDE = 9    # täglicher Bericht ab 9 Uhr (deutsche Zeit)
+
+
+def berlin_jetzt() -> datetime:
+    """Deutsche Uhrzeit inkl. Sommerzeit, ohne Zusatzpakete."""
+    from datetime import timedelta, timezone
+    utc = datetime.now(timezone.utc)
+
+    def letzter_sonntag(jahr, monat):
+        d = datetime(jahr, monat, 31, 1, tzinfo=timezone.utc)
+        return d - timedelta(days=(d.weekday() + 1) % 7)
+
+    sommer = letzter_sonntag(utc.year, 3) <= utc < letzter_sonntag(utc.year, 10)
+    return (utc + timedelta(hours=2 if sommer else 1)).replace(tzinfo=None)
+
+
+def stufen_von(c: dict) -> list[dict]:
+    """Alle Preis-Grenzen eines Coins (neues Format 'stufen' oder altes 'unter'/'ueber')."""
+    stufen = list(c.get("stufen") or [])
+    if c.get("unter"):
+        stufen.append({"art": "unter", "mcap": c["unter"]})
+    if c.get("ueber"):
+        stufen.append({"art": "ueber", "mcap": c["ueber"]})
+    return stufen
+
+
+def letzte_alarme(thema: str) -> dict[str, float]:
+    """Alarm-ID -> Zeitpunkt (Unix) des letzten Pushs, aus dem ntfy-Verlauf (12 h)."""
+    zeiten: dict[str, float] = {}
+    for m in ntfy_verlauf(thema, "12h"):
+        for z in str(m.get("message", "")).splitlines():
+            if z.startswith("Alarm-ID: "):
+                k = z[10:].strip()
+                zeiten[k] = max(zeiten.get(k, 0), float(m.get("time", 0)))
+    return zeiten
+
+
+def pruefe_beobachtung(a: argparse.Namespace) -> None:
+    """Alarme für beobachtete Coins:
+    - Preis-Grenzen (z. B. unter 15 Mio., unter 10 Mio. = ACHTUNG, über 20 Mio.)
+      Jede Grenze meldet sich bei JEDEM neuen Durchbruch: fällt der Coin unter 15 Mio.,
+      erholt sich auf 17 Mio. und fällt wieder, kommt erneut ein Alarm.
+    - Starker Abverkauf / starker Anstieg in der letzten Stunde
+    - Täglicher Bericht ab 9 Uhr"""
+    liste = lade_beobachtung(a.cloud)
+    if not liste:
         return
-    sauber = [e for e in ergebnisse if not e["rug"]["gefahren"]][:10]
-    if not sauber:
-        return
-    thema = a.ntfy + "-top10"
-    nr1 = sauber[0]["adresse"]
-    # Nur neu schicken, wenn sich die Nr. 1 geändert hat oder 30 Min. vergangen sind
-    for m in ntfy_verlauf(thema, f"{TOP10_MINUTEN}m"):
-        if f"Adresse Nr. 1: {nr1}" in str(m.get("message", "")):
-            print("  Top 10: Nr. 1 unverändert, keine neue Liste")
+    print(f"  Beobachtungsliste: {len(liste)} Coin(s) prüfen ...")
+    zustand = lade_zustand()
+    alarme = zustand["alarme"]           # Alarm-ID -> {"scharf": bool, "seit": unix}
+    verlauf = letzte_alarme(a.ntfy) if a.ntfy else {}
+    jetzt = time.time()
+    bericht_zeilen = []
+
+    def ausloesen(alarm_id, titel, text, adresse, url, prio, tags):
+        """Push senden, außer der andere Rechner hat genau diesen Alarm schon geschickt."""
+        st = alarme.setdefault(alarm_id, {"scharf": True, "seit": 0})
+        if not st["scharf"]:
             return
+        if verlauf.get(alarm_id, 0) > st["seit"]:  # Laptop/Cloud hat schon gemeldet
+            st["scharf"] = False
+            return
+        if not a.ntfy:
+            return
+        fomo = FOMO + adresse
+        voll = text + f"\nAlarm-ID: {alarm_id}"
+        daten_ok = sende_push(a.ntfy, titel, voll, fomo, prio=prio,
+                              knoepfe=[("FOMO", fomo), ("DexScreener", url)], tags=tags)
+        if daten_ok:
+            st["scharf"] = False
+            print(f"    -> Alarm: {titel}")
 
-    marken = ["🥇", "🥈", "🥉"]
-    zeilen = []
-    for i, e in enumerate(sauber, 1):
-        k, r = e["k"], e["rug"]
-        rug = "?" if r["risiko"] is None else str(int(r["risiko"]))
-        marke = marken[i - 1] if i <= 3 else f"{i}."
-        zeilen.append(f"{marke} {k['symbol'][:12]}  {e['score']:.0f} P | MCap {geld(k['mcap'])}"
-                      f" | 1h {k['chg1']:+.0f}% | Rug {rug}")
-    zeilen += ["", f"Adresse Nr. 1: {nr1}", "Nur Recherche, keine Kaufempfehlung."]
+    def entschaerfen(alarm_id):
+        st = alarme.setdefault(alarm_id, {"scharf": True, "seit": 0})
+        if not st["scharf"]:
+            st["scharf"] = True
+            st["seit"] = jetzt
 
-    knoepfe = [(f"{i}. {e['k']['symbol'][:10]}", FOMO + e["adresse"])
-               for i, e in enumerate(sauber[:3], 1)]  # ntfy erlaubt max. 3 Knöpfe
-    zeit = datetime.now().strftime("%H:%M")
-    if sende_push(thema, f"🏆 Top 10 ({zeit}) – Nr. 1: {sauber[0]['k']['symbol']}",
-                  "\n".join(zeilen), FOMO + nr1, prio=2, knoepfe=knoepfe, tags=["trophy"]):
-        print(f"  Top-10-Liste ans Handy geschickt (Thema '{thema}')")
+    nach_chain: dict[str, list[dict]] = {}
+    for c in liste:
+        if c.get("adresse"):
+            nach_chain.setdefault(c.get("chain", CHAIN), []).append(c)
+
+    for chain, coins in nach_chain.items():
+        daten = aktuelle_mcap(chain, [c["adresse"] for c in coins])
+        for c in coins:
+            adr = c["adresse"]
+            p = daten.get(adr)
+            if not p:
+                print(f"    {c.get('name', adr)}: keine Daten")
+                continue
+            mcap = p.get("marketCap") or p.get("fdv") or 0
+            sym = (p.get("baseToken") or {}).get("symbol", c.get("name", "?"))
+            chg = p.get("priceChange") or {}
+            tx = ((p.get("txns") or {}).get("h1") or {})
+            k1, v1 = tx.get("buys", 0) or 0, tx.get("sells", 0) or 0
+            url = p.get("url", "")
+            info = (f"1h {chg.get('h1', 0):+.0f}% | 24h {chg.get('h24', 0):+.0f}% | "
+                    f"Käufe/Verkäufe 1h {k1}/{v1}")
+            print(f"    {sym}: Market Cap {geld(mcap)} | {info}")
+            bericht_zeilen.append(f"{sym}: {geld(mcap)} ({chg.get('h24', 0):+.0f}% 24h)")
+
+            # --- Preis-Grenzen ---
+            for s in stufen_von(c):
+                grenze, art = float(s["mcap"]), s["art"]
+                aid = f"{adr}:{art}:{int(grenze)}"
+                achtung = bool(s.get("achtung"))
+                if art == "unter":
+                    erreicht = mcap <= grenze
+                    zurueck = mcap >= grenze * (1 + RUECKSETZ_ABSTAND)
+                    titel = (f"🚨🚨🚨 ACHTUNG: {sym} unter {geld(grenze)} MCap! 🚨🚨🚨" if achtung
+                             else f"⚠️ {sym} unter {geld(grenze)} MCap")
+                    text = f"Market Cap gefallen auf {geld(mcap)}"
+                    tags = ["rotating_light"] if achtung else ["warning"]
+                else:
+                    erreicht = mcap >= grenze
+                    zurueck = mcap <= grenze * (1 - RUECKSETZ_ABSTAND)
+                    titel = (f"🚨🚨🚨 ACHTUNG: {sym} über {geld(grenze)} MCap! 🚨🚨🚨" if achtung
+                             else f"📈 {sym} über {geld(grenze)} MCap")
+                    text = f"Market Cap gestiegen auf {geld(mcap)}"
+                    tags = ["chart_with_upwards_trend"]
+                if s.get("hinweis"):
+                    text += f"\n{s['hinweis']}"
+                if erreicht:
+                    ausloesen(aid, titel, f"{text}\n{info}", adr, url, 5 if achtung else 4, tags)
+                elif zurueck:
+                    entschaerfen(aid)
+
+            # --- Plötzliche Bewegung (alle verkaufen / alle kaufen) ---
+            abv = float(c.get("abverkauf_1h", -15))
+            anst = float(c.get("anstieg_1h", 20))
+            h1 = float(chg.get("h1", 0) or 0)
+            for art, aktiv, titel, tags in [
+                ("abverkauf", h1 <= abv or (v1 >= 2 * max(k1, 1) and k1 + v1 >= 60),
+                 f"🚨🚨🚨 ACHTUNG: {sym} wird stark verkauft! 🚨🚨🚨", ["rotating_light", "chart_with_downwards_trend"]),
+                ("anstieg", h1 >= anst or (k1 >= 2 * max(v1, 1) and k1 + v1 >= 60),
+                 f"🚀 {sym} wird stark gekauft!", ["rocket"]),
+            ]:
+                aid = f"{adr}:{art}"
+                st = alarme.setdefault(aid, {"scharf": True, "seit": 0})
+                if not st["scharf"] and jetzt - st.get("ausgeloest", 0) >= SPRUNG_PAUSE_MIN * 60:
+                    st["scharf"], st["seit"] = True, jetzt  # nach 1 Stunde wieder bereit
+                if aktiv and st["scharf"]:
+                    if verlauf.get(aid, 0) > jetzt - SPRUNG_PAUSE_MIN * 60:
+                        st["scharf"], st["ausgeloest"] = False, verlauf[aid]
+                        continue
+                    ausloesen(aid, titel, f"Market Cap jetzt {geld(mcap)}\n{info}",
+                              adr, url, 5, tags)
+                    if not st["scharf"]:
+                        st["ausgeloest"] = jetzt
+
+    # --- Täglicher Bericht ---
+    heute = berlin_jetzt()
+    if a.ntfy and bericht_zeilen and heute.hour >= TAGESBERICHT_STUNDE:
+        tag = heute.strftime("%Y-%m-%d")
+        aid = f"tagesbericht:{tag}"
+        if zustand.get("letzter_bericht") != tag and aid not in verlauf:
+            if sende_push(a.ntfy, f"Tagesbericht {heute:%d.%m.}",
+                          "\n".join(bericht_zeilen) + f"\nAlarm-ID: {aid}", prio=3,
+                          tags=["bar_chart"]):
+                print("    -> Tagesbericht geschickt")
+                zustand["letzter_bericht"] = tag
+        elif aid in verlauf:
+            zustand["letzter_bericht"] = tag
+
+    speichere_zustand(zustand)
 
 
 # --------------------------------------------------------------------------
@@ -404,6 +585,7 @@ def speichere_csv(ergebnisse: list[dict], datei: str) -> None:
 # --------------------------------------------------------------------------
 def ein_durchlauf(a: argparse.Namespace) -> list[dict]:
     print(f"\n[{datetime.now():%H:%M:%S}] Suche neue {CHAIN.capitalize()}-Memecoins ...")
+    pruefe_beobachtung(a)
     kandidaten = sammle_kandidaten()
     print(f"  {len(kandidaten)} Tokens in den DexScreener-Feeds gefunden")
     if not kandidaten:
@@ -444,7 +626,6 @@ def ein_durchlauf(a: argparse.Namespace) -> list[dict]:
         speichere_csv(top, a.csv)
         print(f"\nGespeichert in {os.path.abspath(a.csv)}")
         melde_treffer(top, a)
-        sende_top10(top, a)
     return top
 
 
@@ -455,7 +636,7 @@ def main(argv=None) -> None:
     ap.add_argument("--max-alter", type=float, default=72, help="Höchstalter des Paars in Stunden (Standard 72)")
     ap.add_argument("--min-tx", type=int, default=30, help="Mindest-Transaktionen letzte Stunde (Standard 30)")
     ap.add_argument("--max-mcap", type=float, default=0, help="Höchste Marketcap in $ (0 = egal)")
-    ap.add_argument("--top", type=int, default=15, help="Wie viele Treffer anzeigen (Standard 15)")
+    ap.add_argument("--top", type=int, default=10, help="Wie viele Treffer anzeigen (Standard 10)")
     ap.add_argument("--watch", type=float, default=0, help="Alle X Minuten wiederholen (0 = nur einmal)")
     ap.add_argument("--csv", default="memecoin_treffer.csv", help="CSV-Datei für die Treffer")
     ap.add_argument("--ohne-rugcheck", action="store_true", help="RugCheck überspringen (schneller)")
@@ -491,11 +672,13 @@ def main(argv=None) -> None:
     print("Memecoin-Sucher - nur Recherche, keine Kaufempfehlung. DYOR!")
     if a.ntfy:
         print(f"Handy-Pushs aktiv (Thema '{a.ntfy}', ab {a.alarm_ab:g} Punkten)")
-        print(f"Top-10-Rangliste im Thema '{a.ntfy}-top10'")
     try:
+        letzter_puls = 0.0
         while True:
-            if a.ntfy and not a.cloud and a.watch > 0:
+            if (a.ntfy and not a.cloud and a.watch > 0
+                    and time.time() - letzter_puls >= PULS_ALLE_MINUTEN * 60 - 30):
                 sende_puls(a.ntfy)  # sagt der Cloud: "Laptop läuft, du kannst pausieren"
+                letzter_puls = time.time()
             ein_durchlauf(a)
             if a.watch <= 0:
                 break

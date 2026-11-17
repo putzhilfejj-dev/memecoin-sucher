@@ -1,0 +1,14 @@
+[
+  {
+    "name": "GTA VI",
+    "chain": "solana",
+    "adresse": "4kjruqGHDsSqkMdFfCjV7Vb62HPFhtXyWc2t6JpQzDnz",
+    "stufen": [
+      {"art": "ueber", "mcap": 20000000},
+      {"art": "unter", "mcap": 15000000},
+      {"art": "unter", "mcap": 13000000, "achtung": true, "hinweis": "Deine ACHTUNG-Grenze ist erreicht!"}
+    ],
+    "abverkauf_1h": -15,
+    "anstieg_1h": 20
+  }
+]
